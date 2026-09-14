@@ -1,6 +1,8 @@
 SAMPLES = glob_wildcards('data_February_2026/{S}_R1_001.fastq.gz').S
 READS = ['R1', 'R2']
 
+print("SAMPLES:")
+print(SAMPLES)
 DNAS = glob_wildcards('QC/posttrimming/VB{dnaS}_R1_001.trimmed_fastp.fastq.gz').dnaS
 
 rule all:
@@ -18,7 +20,20 @@ rule all:
                 expand("alignments/VB{dnas}.vcf.gz", dnas = DNAS),
                 expand("alignments/VB{dnas}_markdup_RG.bam", dnas = DNAS),
                 expand("alignments/VB{dnas}_markdup_RG.bam.bai", dnas = DNAS),
-                expand("alignments/VB{dnas}_gatk.vcf.gz", dnas = DNAS)
+                #expand("alignments/VB{dnas}_gatk.vcf.gz", dnas = DNAS)
+                expand("alignments/VB{dnas}_FB.vcf.gz", dnas = DNAS),
+                expand("alignments/VB{dnas}_FB_filtered.vcf.gz", dnas = DNAS),
+                expand("alignments/VB{dnas}_FB_filtered_sorted.vcf.gz", dnas = DNAS),
+                expand("alignments/VB{dnas}_FB_filtered_sorted.vcf.gz.csi", dnas = DNAS),
+                expand("alignments/VB{dnas}_personalised.fa", dnas = DNAS),
+                expand("alignments/VB{dnas}_personalised_renamed.fa", dnas = DNAS),
+                expand("alignments/VB{dnas}_FB_filtered_sorted_snps_annot.vcf.gz", dnas = DNAS),
+                expand("alignments/VB{dnas}_FB_filtered_sorted_snps_annot.vcf.gz.csi", dnas = DNAS),
+                expand("alignments/VB{dnas}_HISAT2_SNPs.snp", dnas = DNAS),
+                expand("alignments/VB{dnas}_HISAT2_SNPs_renamed.snp", dnas = DNAS),
+                "alignments/concat_VB2_VB3.fa", 
+                "alignments/concat_VB2_VB3.snp"
+
 
 rule fastqc_pre:
         input:
@@ -129,5 +144,112 @@ rule make_vcfs_gatk:
         output:
                "alignments/VB{dnas}_gatk.vcf.gz"
         shell:
-               "gatk HaplotypeCaller -R {input.ref} -I {input.in1} -ploidy {params.ploidy}  --ploidy-regions {input.ploidyregions} -O {output}"
+               "gatk HaplotypeCaller -R {input.ref} -I {input.in1} -ploidy {params.ploidy}  --ploidy-regions {input.ploidyregions} -O {output} --native-pair-hmm-threads {threads}"
         
+
+rule make_vcfs_freebayes:
+        input:  
+               in1="alignments/VB{dnas}_markdup_RG.bam",
+               ploidyregions="alignments/VB{dnas}.bed",
+               ref="Silene_latifolia_genome_v5/Slatifolia.v5.genome.fna",
+               regions="genome.regions" 
+        threads:
+               16 
+        params:
+               ploidy=lambda wc: PLOIDIES[wc.dnas]
+        output: 
+               "alignments/VB{dnas}_FB.vcf.gz"
+        shell:
+               "freebayes-parallel {input.regions} {threads} -f {input.ref} --bam {input.in1} --ploidy {params.ploidy}  --cnv-map {input.ploidyregions} | bgzip -c > {output}"
+
+
+rule filter_freebayes:
+        input:
+               "alignments/VB{dnas}_FB.vcf.gz",
+        output:
+               "alignments/VB{dnas}_FB_filtered.vcf.gz"
+        shell:  
+               "bcftools filter -i 'QUAL>=30 && INFO/DP>=10 && INFO/SAF>0 && INFO/SAR>0' -Oz -o {output} {input}"
+    
+rule index_vcfs:
+        input:
+               "alignments/VB{dnas}_FB_filtered.vcf.gz",
+        output:
+               vcf="alignments/VB{dnas}_FB_filtered_sorted.vcf.gz",
+               idx="alignments/VB{dnas}_FB_filtered_sorted.vcf.gz.csi"
+        shell:
+               "bcftools sort {input} -Oz -o {output.vcf} && bcftools index {output.vcf}"
+
+rule personalise_genomes:
+        input: 
+               vcf="alignments/VB{dnas}_FB_filtered_sorted.vcf.gz",
+               ref="Silene_latifolia_genome_v5/Slatifolia.v5.genome.fna",
+               idx="alignments/VB{dnas}_FB_filtered_sorted.vcf.gz.csi"
+        output:
+               "alignments/VB{dnas}_personalised.fa"
+        shell: 
+               "bcftools consensus -H A -f {input.ref} {input.vcf} > {output}"
+
+
+rule rename_personalised:
+        input:
+               "alignments/VB{dnas}_personalised.fa",
+        output:  
+               "alignments/VB{dnas}_personalised_renamed.fa",
+        shell:
+               """
+               awk '/^>/ {{sub(/^>/, ">VB{wildcards.dnas}_"); print; next}} {{print}}' {input} > {output}
+               """
+
+rule filter_vcf_snps:
+        input:
+               vcf="alignments/VB{dnas}_FB_filtered_sorted.vcf.gz",
+               ref="Silene_latifolia_genome_v5/Slatifolia.v5.genome.fna"
+
+        output:
+               vcf="alignments/VB{dnas}_FB_filtered_sorted_snps_annot.vcf.gz",
+               idx="alignments/VB{dnas}_FB_filtered_sorted_snps_annot.vcf.gz.csi",
+        shell:
+               """
+               bcftools norm -f {input.ref} --atomize -Ou {input.vcf} | bcftools view -v snps -e 'ALT="*"' -Ou |  bcftools annotate --set-id '%CHROM:%POS:%REF:%FIRST_ALT' -Oz -o {output.vcf}
+               bcftools index {output.vcf}
+               """
+
+rule make_hisat2_snps:
+        input:
+               vcf="alignments/VB{dnas}_FB_filtered_sorted_snps_annot.vcf.gz",
+               ref="Silene_latifolia_genome_v5/Slatifolia.v5.genome.fna",
+        output: 
+               "alignments/VB{dnas}_HISAT2_SNPs.snp"
+        shell:
+               "hisat2_extract_snps_haplotypes_VCF.py {input.ref} {input.vcf} alignments/VB{wildcards.dnas}_HISAT2_SNPs  --reference-type genome --non-rs --verbose" 
+
+rule rename_snps:
+        input:
+               "alignments/VB{dnas}_HISAT2_SNPs.snp",
+        output:
+               "alignments/VB{dnas}_HISAT2_SNPs_renamed.snp",
+        shell:
+               """
+               awk -v prefix="VB{wildcards.dnas}_" 'BEGIN{{OFS="\t"}} {{ $3=prefix $3; print }}' {input} > {output}
+               """
+
+rule concatenate_genomes:
+        input:
+               VB2="alignments/VB2_S72_personalised_renamed.fa",
+               VB3="alignments/VB3_S73_personalised_renamed.fa"
+        output:
+               "alignments/concat_VB2_VB3.fa",
+        shell:
+               "cat {input.VB2} {input.VB3} > {output}"
+
+
+rule concatenate_snps:
+        input:
+               VB2="alignments/VB2_S72_HISAT2_SNPs_renamed.snp",
+               VB3="alignments/VB3_S73_HISAT2_SNPs_renamed.snp"
+        output:
+               "alignments/concat_VB2_VB3.snp", 
+        shell:
+               "cat {input.VB2} {input.VB3} > {output}"        
+               
